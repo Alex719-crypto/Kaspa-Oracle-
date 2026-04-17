@@ -942,56 +942,58 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 </html>'''
 
 
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Kaspa Whale Apples</title>
+    <script src="https://jsdelivr.net"></script>
+    <style>
+        body { background: #0f172a; color: white; font-family: sans-serif; margin: 0; overflow: hidden; }
+        .container { width: 95%; margin: auto; padding-top: 20px; }
+        #whaleChart { background: #1e293b; border-radius: 15px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 style="text-align:center; color: #10b981;">🍎 KASPA APPLE TRACKER 🍎</h1>
+        <canvas id="whaleChart" height="120"></canvas>
+    </div>
+    <script>
+        const ctx = document.getElementById('whaleChart').getContext('2d');
+        const appleImg = new Image();
+        appleImg.src = 'https://zobj.net';
+
+        const chart = new Chart(ctx, {
+            type: 'bubble',
+            data: { datasets: [{ label: 'Whale Apples', data: [], backgroundColor: 'rgba(0,0,0,0)' }] },
+            options: {
+                scales: {
+                    x: { type: 'category', grid: { color: '#334155' }, ticks: { color: '#94a3b8' } },
+                    y: { grid: { color: '#334155' }, ticks: { color: '#94a3b8' } }
+                },
+                elements: { point: { pointStyle: appleImg, radius: (c) => c.raw ? Math.sqrt(c.raw.r) * 2 : 5 } }
+            }
+        });
+
+        async function update() {
+            try {
+                const res = await fetch('/api/data');
+                const d = await res.json();
+                chart.data.datasets.data.push({ x: new Date().toLocaleTimeString(), y: d.price, r: d.volume_24h / 1000000 });
+                if (chart.data.datasets.data.length > 20) chart.data.datasets.data.shift();
+                chart.update();
+            } catch (e) {}
+        }
+        setInterval(update, 3000);
+    </script>
+</body>
+</html>
+"""
+
 @app.route("/")
 def index():
     return Response(DASHBOARD_HTML, mimetype="text/html")
 
-
-@app.route("/api/data")
-def api_data():
-    """API endpoint for dashboard data"""
-    return jsonify(current_state)
-
-
-@app.route("/api/whales")
-def api_whales():
-    """API endpoint for whale history"""
-    return jsonify(list(whale_history))
-
-
-@app.route("/api/health")
-def api_health():
-    """Health check endpoint"""
-    return jsonify({
-        "status": "ok",
-        "last_update": current_state.get("last_update"),
-        "price": current_state.get("price", 0)
-    })
-
-
-# ═══════════════════════════════════════════════════════════════
-# 🚀 STARTUP
-# ═══════════════════════════════════════════════════════════════
-
-def start_scanner():
-    """Start the background scanner in a separate thread"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(scanner_loop())
-
-
 if __name__ == "__main__":
-    print("=" * 60)
-    print("🍏 KASPA WHALE ORACLE v4.0")
-    print("=" * 60)
-    print("📊 Dashboard: http://localhost:5000")
-    print("📡 API: http://localhost:5000/api/data")
-    print("🐋 Whales: http://localhost:5000/api/whales")
-    print("=" * 60)
-    
-    # Start scanner in background thread
-    scanner_thread = threading.Thread(target=start_scanner, daemon=True)
-    scanner_thread.start()
-    
-    # Run Flask
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000), debug=False)
