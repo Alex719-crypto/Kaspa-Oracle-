@@ -1,1430 +1,997 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║        Kaspa Whale Oracle v3.1 — Prediction Engine           ║
+║     🍏 KASPA WHALE ORACLE v4.0 — For Whop                   ║
+║     5D Apple Visualization + MEXC + Whale Tracking          ║
 ╠══════════════════════════════════════════════════════════════╣
-║  SECRETS NEEDED (Agentverse → Secrets tab):                  ║
-║    OPEN_API_KEY — ASI-1 key (asi1.ai/developer)              ║
+║  Features:                                                   ║
+║    • Real-time KAS price from MEXC                          ║
+║    • Whale detection from Kaspa blockchain                  ║
+║    • 5-minute price predictions                             ║
+║    • 5D Apple signal visualization 🍏🍎                      ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
 import asyncio
-import os
 import time
-from datetime import datetime, timezone
-from uuid import uuid4
-from typing import Optional
-from collections import deque
 import threading
 import json
+from datetime import datetime, timezone
+from uuid import uuid4
+from collections import deque
 
 import aiohttp
-from flask import Flask, Response
-from pydantic import Field
-
-from uagents import Agent, Context, Model, Protocol
-from uagents.setup import fund_agent_if_low
-from uagents_core.contrib.protocols.chat import (
-    ChatAcknowledgement,
-    ChatMessage,
-    EndSessionContent,
-    TextContent,
-    chat_protocol_spec,
-)
-from uagents_core.contrib.protocols.payment import (
-    CancelPayment,
-    CommitPayment,
-    CompletePayment,
-    Funds,
-    payment_protocol_spec,
-    RejectPayment,
-    RequestPayment,
-)
-
-try:
-    from openai import OpenAI
-    HAS_OPENAI = True
-except ImportError:
-    HAS_OPENAI = False
+from flask import Flask, Response, jsonify
 
 # ═══════════════════════════════════════════════════════════════
-# ⚙️  CONFIGURATION
+# ⚙️ CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
 
-WALLET_ADDRESS    = "fetch1jq6tmuhq34ar8jme532sgxrghg4lw05ztq33n3"
-ASI_API_KEY       = os.environ.get("OPEN_API_KEY", "")
+# MEXC API (no auth needed for public data)
+MEXC_BASE = "https://api.mexc.com/api/v3"
+KAS_SYMBOL = "KASUSDT"
 
-PRICE_FULL        = "0.02"
-PRICE_PREMIUM     = "0.05"
-PAYMENT_DEADLINE  = 180
-SCAN_INTERVAL_SEC = 60.0
+# Kaspa Blockchain API
+KASPA_API = "https://api.kaspa.org"
 
-KAS_WHALE_THRESHOLD   = 500_000
-SOMPI_PER_KAS         = 100_000_000
+# Whale thresholds
+KAS_WHALE_THRESHOLD = 500_000      # 500K KAS = whale
+SOMPI_PER_KAS = 100_000_000
 WHALE_THRESHOLD_SOMPI = KAS_WHALE_THRESHOLD * SOMPI_PER_KAS
-MEGA_WHALE            = 5_000_000
-BIG_WHALE             = 1_000_000
-KAS_USD_ESTIMATE      = 0.12
+MEGA_WHALE = 5_000_000             # 5M KAS
+BIG_WHALE = 1_000_000              # 1M KAS
 
-KAS_API_ENDPOINTS = [
-    "https://api.kaspa.org",
-    "https://kaspa.aspectron.org/api",
-]
-CG_BASE = "https://api.coingecko.com/api/v3"
+# Scan interval
+SCAN_INTERVAL = 30  # seconds
+
+# ═══════════════════════════════════════════════════════════════
+# 📊 DATA STORAGE
+# ═══════════════════════════════════════════════════════════════
+
+MAX_HISTORY = 100
+price_history = deque(maxlen=MAX_HISTORY)
+whale_history = deque(maxlen=50)
+predictions_log = {}
+accuracy_stats = {"total": 0, "correct": 0, "pct": 0.0}
+
+# Current state
+current_state = {
+    "price": 0.0,
+    "price_change_24h": 0.0,
+    "volume_24h": 0.0,
+    "whale_alert": None,
+    "prediction": None,
+    "signal_5d": "🍏🍏🍎🍎🍎",  # neutral start
+    "signal_score": 0,
+    "last_update": None,
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 🍏 5D APPLE SIGNAL CALCULATOR
+# ═══════════════════════════════════════════════════════════════
+
+def calculate_5d_signal(whale_data, price_momentum, prediction_conf):
+    """
+    Calculate 5D Apple Signal
+    
+    Score from -5 (strong sell) to +5 (strong buy)
+    
+    Factors:
+    - Whale activity (buy/sell pressure)
+    - Price momentum
+    - Prediction confidence
+    """
+    score = 0
+    
+    # Factor 1: Whale activity
+    if whale_data:
+        whale_kas = whale_data.get("kas_amount", 0)
+        if whale_kas >= MEGA_WHALE:
+            score += 2  # Mega whale = strong signal
+        elif whale_kas >= BIG_WHALE:
+            score += 1.5
+        elif whale_kas >= KAS_WHALE_THRESHOLD:
+            score += 1
+    
+    # Factor 2: Price momentum (last few candles)
+    if price_momentum > 1.0:
+        score += 1.5
+    elif price_momentum > 0.3:
+        score += 1
+    elif price_momentum < -1.0:
+        score -= 1.5
+    elif price_momentum < -0.3:
+        score -= 1
+    
+    # Factor 3: Prediction confidence
+    if prediction_conf:
+        if prediction_conf.get("direction") == "UP":
+            score += prediction_conf.get("confidence", 0) / 50  # max +2
+        elif prediction_conf.get("direction") == "DOWN":
+            score -= prediction_conf.get("confidence", 0) / 50
+    
+    # Clamp to -5 to +5
+    score = max(-5, min(5, score))
+    
+    # Convert to 5D apples
+    # Score: -5 to +5 → 0 to 5 green apples
+    green_count = int(round((score + 5) / 2))  # 0-5 green apples
+    green_count = max(0, min(5, green_count))
+    red_count = 5 - green_count
+    
+    apples = "🍏" * green_count + "🍎" * red_count
+    
+    return {
+        "apples": apples,
+        "score": round(score, 2),
+        "green": green_count,
+        "red": red_count,
+        "signal": "STRONG BUY" if green_count >= 4 else "BUY" if green_count == 3 else "NEUTRAL" if green_count == 2 else "SELL" if green_count == 1 else "STRONG SELL"
+    }
+
+# ═══════════════════════════════════════════════════════════════
+# 💰 MEXC PRICE FETCHER
+# ═══════════════════════════════════════════════════════════════
+
+async def fetch_mexc_price(session):
+    """Fetch KAS/USDT price from MEXC"""
+    try:
+        # Get ticker
+        url = f"{MEXC_BASE}/ticker/24hr?symbol={KAS_SYMBOL}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                data = await r.json()
+                return {
+                    "price": float(data.get("lastPrice", 0)),
+                    "change_24h": float(data.get("priceChangePercent", 0)),
+                    "high_24h": float(data.get("highPrice", 0)),
+                    "low_24h": float(data.get("lowPrice", 0)),
+                    "volume_24h": float(data.get("volume", 0)),
+                    "quote_volume": float(data.get("quoteVolume", 0)),
+                }
+    except Exception as e:
+        print(f"MEXC Error: {e}")
+    return None
+
+
+async def fetch_mexc_klines(session, interval="1m", limit=30):
+    """Fetch recent candles from MEXC"""
+    try:
+        url = f"{MEXC_BASE}/klines?symbol={KAS_SYMBOL}&interval={interval}&limit={limit}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                data = await r.json()
+                candles = []
+                for k in data:
+                    candles.append({
+                        "time": k[0],
+                        "open": float(k[1]),
+                        "high": float(k[2]),
+                        "low": float(k[3]),
+                        "close": float(k[4]),
+                        "volume": float(k[5]),
+                    })
+                return candles
+    except Exception as e:
+        print(f"MEXC Klines Error: {e}")
+    return []
+
+# ═══════════════════════════════════════════════════════════════
+# 🐋 KASPA WHALE TRACKER
+# ═══════════════════════════════════════════════════════════════
+
+async def fetch_kaspa_whales(session):
+    """Fetch whale transactions from Kaspa blockchain"""
+    try:
+        url = f"{KASPA_API}/blocks?includeTransactions=true&limit=20"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status == 200:
+                data = await r.json()
+                blocks = data if isinstance(data, list) else data.get("blocks", [])
+                
+                whale_txs = []
+                total_whale_kas = 0
+                max_kas = 0
+                
+                for block in blocks:
+                    for tx in block.get("transactions", []):
+                        tx_id = tx.get("transactionId", "")[:16]
+                        for out in tx.get("outputs", []):
+                            try:
+                                sompi = int(out.get("amount", 0))
+                                kas_val = sompi / SOMPI_PER_KAS
+                                
+                                if sompi >= WHALE_THRESHOLD_SOMPI:
+                                    whale_txs.append({
+                                        "tx_id": tx_id,
+                                        "amount": kas_val,
+                                        "address": out.get("scriptPublicKeyAddress", "")[:20] + "..."
+                                    })
+                                    total_whale_kas += kas_val
+                                    max_kas = max(max_kas, kas_val)
+                            except (TypeError, ValueError):
+                                continue
+                
+                if whale_txs:
+                    tier = "MEGA" if max_kas >= MEGA_WHALE else "BIG" if max_kas >= BIG_WHALE else "WHALE"
+                    return {
+                        "detected": True,
+                        "count": len(whale_txs),
+                        "kas_amount": round(max_kas, 2),
+                        "total_volume": round(total_whale_kas, 2),
+                        "tier": tier,
+                        "transactions": whale_txs[:5],
+                        "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+                    }
+                
+                return {"detected": False, "count": 0, "kas_amount": 0, "tier": "NONE"}
+                
+    except Exception as e:
+        print(f"Kaspa API Error: {e}")
+    return {"detected": False, "count": 0, "kas_amount": 0, "tier": "NONE", "error": str(e)}
 
 # ═══════════════════════════════════════════════════════════════
 # 🔮 PREDICTION ENGINE
 # ═══════════════════════════════════════════════════════════════
 
-MAX_HISTORY    = 30
-MAX_OUTCOMES   = 100
-price_history: deque = deque(maxlen=MAX_HISTORY)
-outcome_log:   dict  = {}
-accuracy_stats = {"total": 0, "correct": 0, "pct": 0.0}
-
-
-def record_price_snapshot(kas_price: float, whale_kas: float, whale_count: int):
-    price_history.append({
-        "ts":          time.time(),
-        "price":       kas_price,
-        "whale_kas":   whale_kas,
-        "whale_count": whale_count,
-    })
-
-
-def _calc_momentum() -> float:
-    if len(price_history) < 3:
+def calculate_momentum(candles):
+    """Calculate price momentum from candles"""
+    if len(candles) < 3:
         return 0.0
-    recent = list(price_history)[-3:]
-    p0 = recent[0]["price"]
-    p1 = recent[-1]["price"]
-    return round(((p1 - p0) / p0) * 100, 3) if p0 else 0.0
+    
+    recent = candles[-5:]
+    first_close = recent[0]["close"]
+    last_close = recent[-1]["close"]
+    
+    if first_close > 0:
+        return round(((last_close - first_close) / first_close) * 100, 3)
+    return 0.0
 
 
-def _past_whale_avg(tier: str) -> Optional[float]:
-    hist = list(price_history)
-    if len(hist) < 7:
-        return None
-    results = []
-    for i in range(len(hist) - 2):
-        s = hist[i]
-        if s["whale_kas"] < KAS_WHALE_THRESHOLD:
-            continue
-        h_tier = (
-            "MEGA" if s["whale_kas"] >= MEGA_WHALE
-            else "BIG" if s["whale_kas"] >= BIG_WHALE
-            else "WHALE"
-        )
-        if h_tier != tier:
-            continue
-        p0, p1 = s["price"], hist[i + 1]["price"]
-        if p0 and p1:
-            results.append(((p1 - p0) / p0) * 100)
-    return round(sum(results) / len(results), 3) if results else None
-
-
-def _cleanup_outcome_log():
-    if len(outcome_log) <= MAX_OUTCOMES:
-        return
-    sorted_keys = sorted(
-        outcome_log.keys(),
-        key=lambda k: outcome_log[k].get("ts", 0),
-    )
-    for k in sorted_keys[: len(outcome_log) - MAX_OUTCOMES]:
-        del outcome_log[k]
-
-
-def predict_5min_price(
-    current_price: float,
-    whale_kas: float,
-    whale_count: int,
-    tier: str,
-) -> dict:
+def predict_price(current_price, whale_data, momentum, candles):
+    """Generate 5-minute price prediction"""
+    
     if not current_price or current_price <= 0:
         return {
             "direction": "FLAT",
             "change_pct": 0.0,
             "confidence": 0,
-            "reasoning": "No price data",
-            "price_target": current_price,
-            "scan_id": str(uuid4()),
+            "target": current_price,
+            "reasoning": "No price data"
         }
-
+    
     reasons = []
-
-    if tier == "MEGA":
-        base_pct, base_conf = 1.8, 72
-        reasons.append(f"MEGA whale ({whale_kas:,.0f} KAS) — strongest historical signal")
-    elif tier == "BIG":
-        base_pct, base_conf = 0.9, 58
-        reasons.append(f"BIG whale ({whale_kas:,.0f} KAS) — medium upward pressure")
-    else:
-        base_pct, base_conf = 0.4, 44
-        reasons.append(f"Whale ({whale_kas:,.0f} KAS) — weak buy pressure")
-
-    if whale_count >= 3:
-        base_pct *= 1.4
-        base_conf += 8
-        reasons.append(f"{whale_count} simultaneous whale TXs — cluster signal")
-    elif whale_count == 2:
-        base_pct *= 1.2
-        base_conf += 4
-
-    momentum = _calc_momentum()
-    if momentum > 0.3:
-        base_pct *= 1.15
-        base_conf += 6
-        reasons.append(f"Price momentum +{momentum:.2f}% — confirming")
-    elif momentum < -0.3:
-        base_pct *= 0.70
-        base_conf -= 8
-        reasons.append(f"Price momentum {momentum:.2f}% — headwind")
-
-    if accuracy_stats["total"] >= 5:
-        acc = accuracy_stats["pct"]
-        if acc >= 70:
-            base_conf += 5
-            reasons.append(f"Model accuracy {acc:.0f}% on last {accuracy_stats['total']} calls")
-        elif acc < 45:
-            base_conf -= 10
-            reasons.append(f"Model accuracy {acc:.0f}% — use caution")
-
-    past = _past_whale_avg(tier)
-    if past is not None:
-        if past > 0:
-            base_conf += 7
-            reasons.append(f"Past {tier} whales avg +{past:.2f}% in 5 min")
+    base_pct = 0.0
+    confidence = 40
+    
+    # Factor 1: Whale activity
+    if whale_data and whale_data.get("detected"):
+        tier = whale_data.get("tier", "WHALE")
+        kas_amount = whale_data.get("kas_amount", 0)
+        
+        if tier == "MEGA":
+            base_pct += 1.5
+            confidence += 25
+            reasons.append(f"🐋 MEGA whale {kas_amount:,.0f} KAS")
+        elif tier == "BIG":
+            base_pct += 0.8
+            confidence += 15
+            reasons.append(f"🐋 BIG whale {kas_amount:,.0f} KAS")
         else:
-            base_pct *= 0.8
-            base_conf -= 5
-            reasons.append(f"Past {tier} whales avg {past:.2f}% — mixed")
-
-    base_pct  = round(min(base_pct, 5.0), 2)
-    base_conf = max(20, min(base_conf, 92))
+            base_pct += 0.4
+            confidence += 8
+            reasons.append(f"🐋 Whale {kas_amount:,.0f} KAS")
+    
+    # Factor 2: Momentum
+    if momentum > 0.5:
+        base_pct += momentum * 0.3
+        confidence += 10
+        reasons.append(f"📈 Momentum +{momentum:.2f}%")
+    elif momentum < -0.5:
+        base_pct += momentum * 0.3  # negative
+        confidence += 5
+        reasons.append(f"📉 Momentum {momentum:.2f}%")
+    
+    # Factor 3: Volume analysis from candles
+    if candles and len(candles) >= 5:
+        recent_vol = sum(c["volume"] for c in candles[-3:]) / 3
+        older_vol = sum(c["volume"] for c in candles[-6:-3]) / 3 if len(candles) >= 6 else recent_vol
+        
+        if older_vol > 0:
+            vol_change = (recent_vol - older_vol) / older_vol
+            if vol_change > 0.5:
+                base_pct *= 1.2
+                confidence += 8
+                reasons.append("📊 Volume surge")
+    
+    # Determine direction
     direction = "UP" if base_pct > 0.1 else "DOWN" if base_pct < -0.1 else "FLAT"
-    target    = round(current_price * (1 + base_pct / 100), 6)
-
+    
+    # Clamp values
+    base_pct = round(max(-5, min(5, base_pct)), 2)
+    confidence = max(20, min(90, confidence))
+    target = round(current_price * (1 + base_pct / 100), 6)
+    
     return {
         "direction": direction,
         "change_pct": base_pct,
-        "confidence": base_conf,
-        "reasoning": " | ".join(reasons),
-        "price_target": target,
-        "scan_id": str(uuid4()),
-    }
-
-
-def predict_no_whale(current_price: float) -> dict:
-    if not current_price or current_price <= 0:
-        return {
-            "direction": "FLAT",
-            "change_pct": 0.0,
-            "confidence": 0,
-            "reasoning": "No price data",
-            "price_target": current_price,
-            "scan_id": str(uuid4()),
-        }
-
-    momentum = _calc_momentum()
-    if abs(momentum) < 0.1:
-        return {
-            "direction": "FLAT",
-            "change_pct": 0.0,
-            "confidence": 30,
-            "reasoning": "Low volatility, no whale activity",
-            "price_target": current_price,
-            "scan_id": str(uuid4()),
-        }
-
-    direction  = "UP" if momentum > 0 else "DOWN"
-    change     = round(min(max(momentum * 0.25, -1.5), 1.5), 2)
-    confidence = max(20, min(45, int(abs(momentum) * 15)))
-    target     = round(current_price * (1 + change / 100), 6)
-
-    return {
-        "direction": direction,
-        "change_pct": change,
         "confidence": confidence,
-        "reasoning": f"Momentum-based: {momentum:+.2f}% trend | No whale activity",
-        "price_target": target,
-        "scan_id": str(uuid4()),
+        "target": target,
+        "reasoning": " | ".join(reasons) if reasons else "Low activity"
     }
 
-
-def verify_prediction_outcome(scan_id: str, current_price: float):
-    entry = outcome_log.get(scan_id)
-    if not entry or entry.get("verified"):
-        return
-    old_price  = entry.get("price_at_prediction")
-    if not old_price:
-        return
-    actual_pct = ((current_price - old_price) / old_price) * 100
-    actual_dir = "UP" if actual_pct > 0.05 else "DOWN" if actual_pct < -0.05 else "FLAT"
-    correct    = actual_dir == entry["pred_dir"]
-    entry.update({"actual_pct": round(actual_pct, 3), "correct": correct, "verified": True})
-    accuracy_stats["total"]   += 1
-    accuracy_stats["correct"] += int(correct)
-    t = accuracy_stats["total"]
-    accuracy_stats["pct"] = round((accuracy_stats["correct"] / t) * 100, 1) if t else 0.0
-
-
-def verify_all_pending(kas_price: float):
-    now = time.time()
-    for sid, entry in list(outcome_log.items()):
-        if not entry.get("verified") and (now - entry.get("ts", 0)) >= 300:
-            verify_prediction_outcome(sid, kas_price)
-
 # ═══════════════════════════════════════════════════════════════
-# 📊 MODELS
+# 🔄 MAIN SCANNER
 # ═══════════════════════════════════════════════════════════════
 
-class WhaleAlert(Model):
-    kas_amount:   float
-    whale_count:  int
-    tier:         str
-    timestamp:    str
-    total_volume: float = 0.0
-    transactions: list  = Field(default_factory=list)
-
-
-class PricePrediction(Model):
-    direction:    str
-    change_pct:   float
-    confidence:   int
-    price_now:    float
-    price_target: float
-    reasoning:    str
-    scan_id:      str
-    tier:         str
-
-
-class ChainMetrics(Model):
-    chain:        str
-    signal:       str
-    metric_value: float
-    metric_label: str
-    note:         str
-    confidence:   int = 50
-
-
-class IntelligenceReport(Model):
-    sentiment:       str
-    sentiment_score: int
-    confidence:      int
-    kas:             ChainMetrics
-    sol:             ChainMetrics
-    tao:             ChainMetrics
-    fet:             ChainMetrics
-    whale_alert:     Optional[WhaleAlert]      = None
-    prediction:      Optional[PricePrediction] = None
-    timestamp:       str
-    node:            str
-    scan_id:         str
-
-
-class IntelRequest(Model):
-    min_score: int = 0
-
-
-class ErrorResponse(Model):
-    error: str
-
-# ═══════════════════════════════════════════════════════════════
-# 📝 FORMATTERS
-# ═══════════════════════════════════════════════════════════════
-
-def fmt_prediction_text(pred: PricePrediction) -> str:
-    arrow    = "⬆️ UP" if pred.direction == "UP" else "⬇️ DOWN" if pred.direction == "DOWN" else "➡️ FLAT"
-    conf_bar = "█" * (pred.confidence // 10) + "░" * (10 - pred.confidence // 10)
-    return (
-        f"🔮 **5-MIN PRICE PREDICTION**\n{'─' * 28}\n"
-        f"Direction: **{arrow}**\n"
-        f"Expected:  **{pred.change_pct:+.2f}%**\n"
-        f"Target:    **${pred.price_target:.6f}**\n"
-        f"Now:       **${pred.price_now:.6f}**\n"
-        f"Confidence:[{conf_bar}] **{pred.confidence}%**\n"
-        f"Trigger:   **{pred.tier}**\n\n"
-        f"_{pred.reasoning[:220]}_\n\n"
-        f"Model accuracy: **{accuracy_stats['pct']:.1f}%** "
-        f"({accuracy_stats['correct']}/{accuracy_stats['total']})\n\n"
-        f"⚠️ _Not financial advice. DYOR._"
-    )
-
-
-def fmt_market_text(r: IntelligenceReport) -> str:
-    def sig(s):
-        return "🟢" if s == "BULLISH" else "🔴" if s == "BEARISH" else "🟡"
-
-    conf_bar = "█" * (r.confidence // 10) + "░" * (10 - r.confidence // 10)
-
-    whale_sec = (
-        f"\n🐋 **WHALE**: {r.whale_alert.kas_amount:,.0f} KAS | "
-        f"{r.whale_alert.whale_count} TX(s) | {r.whale_alert.tier}\n"
-        if r.whale_alert and r.whale_alert.whale_count > 0
-        else "\n🌊 Whale Monitor: Quiet\n"
-    )
-
-    pred_sec = ""
-    if r.prediction:
-        p     = r.prediction
-        arrow = "⬆️" if p.direction == "UP" else "⬇️" if p.direction == "DOWN" else "➡️"
-        pred_sec = (
-            f"🔮 **5-min prediction**: {arrow} **{p.direction} {p.change_pct:+.2f}%** "
-            f"(conf: {p.confidence}%)\n"
-        )
-
-    acc_sec = (
-        f"🎯 Model accuracy: **{accuracy_stats['pct']:.0f}%** "
-        f"({accuracy_stats['correct']}/{accuracy_stats['total']})\n"
-        if accuracy_stats["total"] >= 3
-        else ""
-    )
-
-    return (
-        f"🌐 **KASPA WHALE ORACLE REPORT**\n{'─' * 32}\n"
-        f"📊 Sentiment: **{r.sentiment}**\n"
-        f"🎯 Score: **{r.sentiment_score}/4**\n"
-        f"📈 Confidence: [{conf_bar}] {r.confidence}%\n{'─' * 32}\n"
-        f"{sig(r.kas.signal)} **KAS**: {r.kas.note}\n"
-        f"{sig(r.sol.signal)} **SOL**: {r.sol.note}\n"
-        f"{sig(r.tao.signal)} **TAO**: {r.tao.note}\n"
-        f"{sig(r.fet.signal)} **FET**: {r.fet.note}\n"
-        f"{whale_sec}{pred_sec}{'─' * 32}\n"
-        f"{acc_sec}"
-        f"🕐 {r.timestamp} | 🔄 60 sec\n"
-        f"💎 Full report: 0.02 FET | ⚠️ _DYOR_"
-    )
-
-# ═══════════════════════════════════════════════════════════════
-# 🌐 DATA FETCHERS
-# ═══════════════════════════════════════════════════════════════
-
-async def fetch_kas_price(session) -> float:
-    try:
-        async with session.get(
-            f"{CG_BASE}/simple/price?ids=kaspa&vs_currencies=usd",
-            timeout=aiohttp.ClientTimeout(total=8),
-        ) as r:
-            if r.status == 200:
-                data = await r.json(content_type=None)
-                return float(data.get("kaspa", {}).get("usd", KAS_USD_ESTIMATE))
-    except Exception:
-        pass
-    return KAS_USD_ESTIMATE
-
-
-async def fetch_with_retry(session, url, retries=3):
-    for i in range(retries):
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
-                if r.status == 429:
-                    await asyncio.sleep(2 ** i)
-                    continue
-                if r.status == 200:
-                    return await r.json(content_type=None)
-        except Exception:
-            await asyncio.sleep(0.5 * i)
-    return None
-
-
-async def fetch_kas(session) -> tuple:
-    for api_base in KAS_API_ENDPOINTS:
-        try:
-            raw = await fetch_with_retry(
-                session,
-                f"{api_base}/blocks?includeTransactions=true&limit=20",
-            )
-            if not raw:
-                continue
-            blocks = (
-                raw.get("blocks", [])
-                if isinstance(raw, dict)
-                else (raw if isinstance(raw, list) else [])
-            )
-            whale_count, max_kas, total_kas, whale_txs = 0, 0.0, 0.0, []
-            for block in blocks:
-                for tx in block.get("transactions", []):
-                    tx_id = (tx.get("transactionId") or "")[:20]
-                    for out in tx.get("outputs", []):
-                        try:
-                            sompi = int(out.get("amount", 0))
-                        except (TypeError, ValueError):
-                            continue
-                        kas_val = sompi / SOMPI_PER_KAS
-                        if sompi >= WHALE_THRESHOLD_SOMPI:
-                            whale_count += 1
-                            total_kas += kas_val
-                            max_kas = max(max_kas, kas_val)
-                            whale_txs.append({"tx_id": tx_id, "amount": kas_val})
-            ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
-            if whale_count > 0:
-                tier = (
-                    "MEGA" if max_kas >= MEGA_WHALE
-                    else "BIG" if max_kas >= BIG_WHALE
-                    else "WHALE"
-                )
-                conf = 75 if tier == "MEGA" else 65 if tier == "BIG" else 55
-                wa = WhaleAlert(
-                    kas_amount=round(max_kas, 2),
-                    whale_count=whale_count,
-                    tier=tier,
-                    timestamp=ts,
-                    total_volume=round(total_kas, 2),
-                    transactions=whale_txs[:5],
-                )
-                signal = "BULLISH"
-                note   = f"🐋 {whale_count} whale TX | Max: {max_kas:,.0f} KAS"
-            else:
-                wa     = WhaleAlert(kas_amount=0, whale_count=0, tier="NONE", timestamp=ts)
-                signal = "NEUTRAL"
-                conf   = 50
-                note   = "No whales in latest blocks"
-
-            metrics = ChainMetrics(
-                chain="KAS",
-                signal=signal,
-                metric_value=round(max_kas, 2),
-                metric_label="Largest whale TX (KAS)",
-                note=note,
-                confidence=conf,
-            )
-            return metrics, wa
-        except Exception:
-            continue
-
-    return (
-        ChainMetrics(
-            chain="KAS", signal="NEUTRAL", metric_value=0.0,
-            metric_label="API Error", note="KAS API unavailable", confidence=30,
-        ),
-        None,
-    )
-
-
-async def fetch_sol(session) -> ChainMetrics:
-    try:
-        data = await fetch_with_retry(
-            session,
-            f"{CG_BASE}/coins/solana/market_chart?vs_currency=usd&days=1",
-        )
-        if not data:
-            raise ValueError("No SOL data")
-        prices = data.get("prices", [])
-        if len(prices) >= 2:
-            prev, curr = prices[-2][1], prices[-1][1]
-            change = ((curr - prev) / prev) * 100 if prev else 0
-            signal = "BULLISH" if change > 0.5 else "BEARISH" if change < -0.5 else "NEUTRAL"
-            return ChainMetrics(
-                chain="SOL", signal=signal,
-                metric_value=round(change, 3),
-                metric_label="Price momentum %",
-                note=f"${curr:.2f} | {change:+.2f}%",
-                confidence=70 if abs(change) > 1.5 else 55,
-            )
-    except Exception:
-        pass
-    return ChainMetrics(
-        chain="SOL", signal="NEUTRAL", metric_value=0,
-        metric_label="Error", note="SOL unavailable", confidence=30,
-    )
-
-
-async def fetch_coin(session, coin_id: str, name: str) -> ChainMetrics:
-    try:
-        data = await fetch_with_retry(
-            session,
-            f"{CG_BASE}/coins/markets?vs_currency=usd&ids={coin_id}",
-        )
-        if not data or not isinstance(data, list):
-            raise ValueError("Invalid response")
-        d      = data[0]
-        price  = d.get("current_price") or 0
-        change = d.get("price_change_percentage_24h") or 0
-        vol    = d.get("total_volume") or 0
-        mcap   = d.get("market_cap") or 1
-        vm     = vol / mcap
-        signal = (
-            "BULLISH" if change > 2 and vm > 0.05
-            else "BEARISH" if change < -2
-            else "NEUTRAL"
-        )
-        conf = 70 if abs(change) > 5 else 55 if abs(change) > 2 else 45
-        return ChainMetrics(
-            chain=name, signal=signal,
-            metric_value=round(change, 2),
-            metric_label="24h change %",
-            note=f"${price:.4f} | {change:+.2f}%",
-            confidence=conf,
-        )
-    except Exception:
-        pass
-    return ChainMetrics(
-        chain=name, signal="NEUTRAL", metric_value=0,
-        metric_label="Error", note=f"{name} unavailable", confidence=30,
-    )
-
-# ═══════════════════════════════════════════════════════════════
-# 🔄 ORCHESTRATOR
-# ═══════════════════════════════════════════════════════════════
-
-_FB_KAS = ChainMetrics(chain="KAS", signal="NEUTRAL", metric_value=0, metric_label="Error", note="Failed", confidence=30)
-_FB_SOL = ChainMetrics(chain="SOL", signal="NEUTRAL", metric_value=0, metric_label="Error", note="Failed", confidence=30)
-_FB_TAO = ChainMetrics(chain="TAO", signal="NEUTRAL", metric_value=0, metric_label="Error", note="Failed", confidence=30)
-_FB_FET = ChainMetrics(chain="FET", signal="NEUTRAL", metric_value=0, metric_label="Error", note="Failed", confidence=30)
-
-
-async def run_all_scans() -> tuple:
+async def run_scan():
+    """Main scan function - runs every SCAN_INTERVAL seconds"""
+    global current_state
+    
     async with aiohttp.ClientSession() as session:
+        # Fetch all data concurrently
         results = await asyncio.gather(
-            fetch_kas(session),
-            fetch_sol(session),
-            fetch_coin(session, "bittensor", "TAO"),
-            fetch_coin(session, "fetch-ai", "FET"),
-            fetch_kas_price(session),
-            return_exceptions=True,
+            fetch_mexc_price(session),
+            fetch_mexc_klines(session),
+            fetch_kaspa_whales(session),
+            return_exceptions=True
         )
+    
+    mexc_data = results[0] if not isinstance(results[0], Exception) else None
+    candles = results[1] if not isinstance(results[1], Exception) else []
+    whale_data = results[2] if not isinstance(results[2], Exception) else {"detected": False}
+    
+    # Update price
+    price = mexc_data["price"] if mexc_data else current_state["price"]
+    
+    # Calculate momentum
+    momentum = calculate_momentum(candles)
+    
+    # Generate prediction
+    prediction = predict_price(price, whale_data, momentum, candles)
+    
+    # Calculate 5D signal
+    signal_5d = calculate_5d_signal(whale_data if whale_data.get("detected") else None, momentum, prediction)
+    
+    # Record price history
+    price_history.append({
+        "ts": time.time(),
+        "price": price,
+        "momentum": momentum,
+        "whale": whale_data.get("detected", False)
+    })
+    
+    # Record whale if detected
+    if whale_data.get("detected"):
+        whale_history.append({
+            "ts": time.time(),
+            "data": whale_data
+        })
+    
+    # Update current state
+    current_state = {
+        "price": price,
+        "price_change_24h": mexc_data.get("change_24h", 0) if mexc_data else 0,
+        "volume_24h": mexc_data.get("volume_24h", 0) if mexc_data else 0,
+        "high_24h": mexc_data.get("high_24h", 0) if mexc_data else 0,
+        "low_24h": mexc_data.get("low_24h", 0) if mexc_data else 0,
+        "whale_alert": whale_data if whale_data.get("detected") else None,
+        "prediction": prediction,
+        "signal_5d": signal_5d,
+        "momentum": momentum,
+        "candles": candles[-30:],  # last 30 candles for chart
+        "last_update": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+    
+    # Log
+    whale_str = f"🐋 {whale_data['tier']} {whale_data['kas_amount']:,.0f} KAS" if whale_data.get("detected") else "🌊 No whales"
+    print(f"📊 KAS ${price:.5f} | {signal_5d['apples']} | {whale_str} | 🔮 {prediction['direction']} {prediction['change_pct']:+.2f}%")
+    
+    return current_state
 
-    def safe(r, fb):
-        return r if not isinstance(r, Exception) else fb
 
-    kas, wa   = safe(results[0], (_FB_KAS, None))
-    sol       = safe(results[1], _FB_SOL)
-    tao       = safe(results[2], _FB_TAO)
-    fet       = safe(results[3], _FB_FET)
-    kas_price = safe(results[4], KAS_USD_ESTIMATE)
+async def scanner_loop():
+    """Background scanner loop"""
+    while True:
+        try:
+            await run_scan()
+        except Exception as e:
+            print(f"❌ Scanner error: {e}")
+        await asyncio.sleep(SCAN_INTERVAL)
 
-    prediction = None
+# ═══════════════════════════════════════════════════════════════
+# 🌐 FLASK WEB APP
+# ═══════════════════════════════════════════════════════════════
 
-    if wa and wa.whale_count > 0 and wa.kas_amount > 0:
-        pd = predict_5min_price(kas_price, wa.kas_amount, wa.whale_count, wa.tier)
-        prediction = PricePrediction(
-            direction=pd["direction"],
-            change_pct=pd["change_pct"],
-            confidence=pd["confidence"],
-            price_now=round(kas_price, 6),
-            price_target=pd["price_target"],
-            reasoning=pd["reasoning"],
-            scan_id=pd["scan_id"],
-            tier=wa.tier,
-        )
-        outcome_log[pd["scan_id"]] = {
-            "ts":                  time.time(),
-            "pred_dir":            pd["direction"],
-            "pred_pct":            pd["change_pct"],
-            "price_at_prediction": kas_price,
-            "verified":            False,
+app = Flask(__name__)
+
+DASHBOARD_HTML = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🍏 Kaspa Whale Oracle</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Inter:wght@400;500;600&display=swap');
+        
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        
+        body {
+            background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
+            min-height: 100vh;
+            color: #fff;
+            font-family: 'Inter', sans-serif;
         }
-        _cleanup_outcome_log()
-    else:
-        pd = predict_no_whale(kas_price)
-        prediction = PricePrediction(
-            direction=pd["direction"],
-            change_pct=pd["change_pct"],
-            confidence=pd["confidence"],
-            price_now=round(kas_price, 6),
-            price_target=pd["price_target"],
-            reasoning=pd["reasoning"],
-            scan_id=pd["scan_id"],
-            tier="NONE",
-        )
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        /* Header */
+        .header {
+            text-align: center;
+            padding: 30px 0;
+            border-bottom: 1px solid rgba(34, 197, 94, 0.2);
+            margin-bottom: 30px;
+        }
+        
+        .header h1 {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 36px;
+            font-weight: 900;
+            background: linear-gradient(135deg, #22c55e, #3b82f6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+        
+        .header .subtitle {
+            color: #6b7280;
+            font-size: 14px;
+        }
+        
+        /* 5D Signal Box */
+        .signal-box {
+            background: linear-gradient(135deg, #111827, #1f2937);
+            border: 2px solid rgba(34, 197, 94, 0.3);
+            border-radius: 20px;
+            padding: 30px;
+            text-align: center;
+            margin-bottom: 30px;
+            box-shadow: 0 0 40px rgba(34, 197, 94, 0.1);
+        }
+        
+        .signal-box h2 {
+            font-family: 'Orbitron', sans-serif;
+            color: #9ca3af;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 3px;
+            margin-bottom: 15px;
+        }
+        
+        .apples {
+            font-size: 64px;
+            letter-spacing: 10px;
+            margin: 20px 0;
+            filter: drop-shadow(0 0 20px rgba(34, 197, 94, 0.5));
+        }
+        
+        .signal-label {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 24px;
+            font-weight: 700;
+            margin-top: 15px;
+        }
+        
+        .signal-label.buy { color: #22c55e; }
+        .signal-label.sell { color: #ef4444; }
+        .signal-label.neutral { color: #f59e0b; }
+        
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: rgba(17, 24, 39, 0.8);
+            border: 1px solid rgba(75, 85, 99, 0.3);
+            border-radius: 16px;
+            padding: 24px;
+            transition: all 0.3s;
+        }
+        
+        .stat-card:hover {
+            border-color: rgba(34, 197, 94, 0.5);
+            transform: translateY(-2px);
+        }
+        
+        .stat-card .label {
+            color: #6b7280;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+        
+        .stat-card .value {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 28px;
+            font-weight: 700;
+            color: #fff;
+        }
+        
+        .stat-card .value.green { color: #22c55e; }
+        .stat-card .value.red { color: #ef4444; }
+        .stat-card .value.yellow { color: #f59e0b; }
+        
+        .stat-card .sub {
+            color: #4b5563;
+            font-size: 12px;
+            margin-top: 5px;
+        }
+        
+        /* Whale Alert */
+        .whale-alert {
+            background: linear-gradient(135deg, #1e3a5f, #111827);
+            border: 2px solid #3b82f6;
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 30px;
+            display: none;
+        }
+        
+        .whale-alert.active {
+            display: block;
+            animation: pulse-border 2s infinite;
+        }
+        
+        @keyframes pulse-border {
+            0%, 100% { border-color: #3b82f6; box-shadow: 0 0 20px rgba(59, 130, 246, 0.3); }
+            50% { border-color: #22c55e; box-shadow: 0 0 30px rgba(34, 197, 94, 0.5); }
+        }
+        
+        .whale-alert h3 {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 18px;
+            color: #22c55e;
+            margin-bottom: 15px;
+        }
+        
+        .whale-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+        }
+        
+        /* Prediction Box */
+        .prediction-box {
+            background: linear-gradient(135deg, #064e3b, #111827);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 30px;
+        }
+        
+        .prediction-box h3 {
+            font-family: 'Orbitron', sans-serif;
+            color: #9ca3af;
+            font-size: 14px;
+            margin-bottom: 15px;
+        }
+        
+        .prediction-direction {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 36px;
+            font-weight: 900;
+        }
+        
+        .prediction-direction.up { color: #22c55e; }
+        .prediction-direction.down { color: #ef4444; }
+        .prediction-direction.flat { color: #f59e0b; }
+        
+        /* Chart Container */
+        .chart-container {
+            background: rgba(17, 24, 39, 0.8);
+            border: 1px solid rgba(75, 85, 99, 0.3);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .chart-container h3 {
+            font-family: 'Orbitron', sans-serif;
+            color: #9ca3af;
+            font-size: 14px;
+            margin-bottom: 15px;
+        }
+        
+        #price-chart {
+            width: 100%;
+            height: 300px;
+            background: #0a0a0f;
+            border-radius: 8px;
+        }
+        
+        /* Footer */
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: #374151;
+            font-size: 12px;
+            border-top: 1px solid rgba(75, 85, 99, 0.2);
+            margin-top: 30px;
+        }
+        
+        .live-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: #22c55e;
+            border-radius: 50%;
+            margin-right: 5px;
+            animation: blink 1s infinite;
+        }
+        
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .header h1 { font-size: 24px; }
+            .apples { font-size: 48px; }
+            .stat-card .value { font-size: 22px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>🍏 KASPA WHALE ORACLE</h1>
+            <p class="subtitle">Real-time whale tracking • 5D Signal • Price predictions</p>
+        </header>
+        
+        <!-- 5D Signal -->
+        <div class="signal-box">
+            <h2>5D Trading Signal</h2>
+            <div class="apples" id="apples">🍏🍏🍎🍎🍎</div>
+            <div class="signal-label neutral" id="signal-label">LOADING...</div>
+            <div style="color: #6b7280; margin-top: 10px; font-size: 14px;">
+                Score: <span id="signal-score">0</span>/5
+            </div>
+        </div>
+        
+        <!-- Stats Grid -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="label">💰 KAS Price</div>
+                <div class="value" id="price">\$0.00000</div>
+                <div class="sub">MEXC Real-time</div>
+            </div>
+            
+            <div class="stat-card">
+                <div class="label">📈 24h Change</div>
+                <div class="value" id="change-24h">0.00%</div>
+                <div class="sub">Last 24 hours</div>
+            </div>
+            
+            <div class="stat-card">
+                <div class="label">📊 24h Volume</div>
+                <div class="value" id="volume-24h">0</div>
+                <div class="sub">KAS traded</div>
+            </div>
+            
+            <div class="stat-card">
+                <div class="label">🎯 Momentum</div>
+                <div class="value" id="momentum">0.00%</div>
+                <div class="sub">Short-term trend</div>
+            </div>
+        </div>
+        
+        <!-- Whale Alert -->
+        <div class="whale-alert" id="whale-alert">
+            <h3>🐋 WHALE DETECTED!</h3>
+            <div class="whale-details">
+                <div>
+                    <div class="label">Amount</div>
+                    <div class="value green" id="whale-amount">0 KAS</div>
+                </div>
+                <div>
+                    <div class="label">Tier</div>
+                    <div class="value yellow" id="whale-tier">--</div>
+                </div>
+                <div>
+                    <div class="label">Transactions</div>
+                    <div class="value" id="whale-count">0</div>
+                </div>
+                <div>
+                    <div class="label">Detected</div>
+                    <div class="value" id="whale-time">--</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Prediction -->
+        <div class="prediction-box">
+            <h3>🔮 5-MINUTE PREDICTION</h3>
+            <div style="display: flex; align-items: center; gap: 20px; flex-wrap: wrap;">
+                <div class="prediction-direction up" id="pred-direction">⬆️ UP</div>
+                <div>
+                    <div style="font-size: 24px; font-weight: bold;" id="pred-change">+0.00%</div>
+                    <div style="color: #6b7280; font-size: 12px;">Expected change</div>
+                </div>
+                <div>
+                    <div style="font-size: 24px; font-weight: bold;" id="pred-target">\$0.00000</div>
+                    <div style="color: #6b7280; font-size: 12px;">Target price</div>
+                </div>
+                <div>
+                    <div style="font-size: 24px; font-weight: bold;" id="pred-conf">0%</div>
+                    <div style="color: #6b7280; font-size: 12px;">Confidence</div>
+                </div>
+            </div>
+            <div style="color: #6b7280; margin-top: 15px; font-size: 13px;" id="pred-reasoning">
+                Loading analysis...
+            </div>
+        </div>
+        
+        <!-- Chart -->
+        <div class="chart-container">
+            <h3>📊 PRICE CHART (30 min)</h3>
+            <canvas id="price-chart"></canvas>
+        </div>
+        
+        <footer class="footer">
+            <p><span class="live-dot"></span> LIVE • Updates every 30 seconds</p>
+            <p style="margin-top: 10px;">⚠️ Not financial advice. DYOR. • Powered by MEXC & Kaspa API</p>
+            <p style="margin-top: 5px;" id="last-update">Last update: --</p>
+        </footer>
+    </div>
+    
+    <script>
+        // Simple chart drawing
+        function drawChart(candles) {
+            const canvas = document.getElementById('price-chart');
+            const ctx = canvas.getContext('2d');
+            
+            // Set canvas size
+            canvas.width = canvas.offsetWidth * 2;
+            canvas.height = 600;
+            ctx.scale(2, 2);
+            
+            const width = canvas.offsetWidth;
+            const height = 300;
+            
+            // Clear
+            ctx.fillStyle = '#0a0a0f';
+            ctx.fillRect(0, 0, width, height);
+            
+            if (!candles || candles.length < 2) {
+                ctx.fillStyle = '#374151';
+                ctx.font = '14px Inter';
+                ctx.textAlign = 'center';
+                ctx.fillText('Waiting for data...', width/2, height/2);
+                return;
+            }
+            
+            // Calculate min/max
+            const prices = candles.flatMap(c => [c.high, c.low]);
+            const minP = Math.min(...prices) * 0.9995;
+            const maxP = Math.max(...prices) * 1.0005;
+            const range = maxP - minP || 0.00001;
+            
+            const pad = 40;
+            const chartWidth = width - pad * 2;
+            const chartHeight = height - pad * 2;
+            
+            function toX(i) { return pad + (i / (candles.length - 1)) * chartWidth; }
+            function toY(p) { return pad + (1 - (p - minP) / range) * chartHeight; }
+            
+            // Draw grid
+            ctx.strokeStyle = 'rgba(75, 85, 99, 0.2)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 5; i++) {
+                const y = pad + (chartHeight / 5) * i;
+                ctx.beginPath();
+                ctx.moveTo(pad, y);
+                ctx.lineTo(width - pad, y);
+                ctx.stroke();
+                
+                const price = maxP - (range / 5) * i;
+                ctx.fillStyle = '#4b5563';
+                ctx.font = '10px Inter';
+                ctx.textAlign = 'right';
+                ctx.fillText('$' + price.toFixed(5), pad - 5, y + 3);
+            }
+            
+            // Draw candles
+            const candleWidth = Math.max(4, chartWidth / candles.length * 0.7);
+            
+            candles.forEach((c, i) => {
+                const x = toX(i);
+                const isUp = c.close >= c.open;
+                
+                // Wick
+                ctx.strokeStyle = isUp ? '#22c55e' : '#ef4444';
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(x, toY(c.high));
+                ctx.lineTo(x, toY(c.low));
+                ctx.stroke();
+                
+                // Body
+                const bodyTop = toY(Math.max(c.open, c.close));
+                const bodyBottom = toY(Math.min(c.open, c.close));
+                const bodyHeight = Math.max(bodyBottom - bodyTop, 1);
+                
+                ctx.fillStyle = isUp ? '#22c55e' : '#ef4444';
+                ctx.fillRect(x - candleWidth/2, bodyTop, candleWidth, bodyHeight);
+            });
+            
+            // Current price line
+            const lastPrice = candles[candles.length - 1].close;
+            ctx.strokeStyle = '#3b82f6';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath();
+            ctx.moveTo(pad, toY(lastPrice));
+            ctx.lineTo(width - pad, toY(lastPrice));
+            ctx.stroke();
+            ctx.setLineDash([]);
+            
+            ctx.fillStyle = '#3b82f6';
+            ctx.font = 'bold 11px Inter';
+            ctx.textAlign = 'left';
+            ctx.fillText('$' + lastPrice.toFixed(5), width - pad + 5, toY(lastPrice) + 3);
+        }
+        
+        // Update UI
+        async function updateData() {
+            try {
+                const res = await fetch('/api/data');
+                const d = await res.json();
+                
+                if (d.error) {
+                    console.error(d.error);
+                    return;
+                }
+                
+                // Price
+                document.getElementById('price').textContent = '$' + d.price.toFixed(5);
+                
+                // 24h change
+                const changeEl = document.getElementById('change-24h');
+                changeEl.textContent = (d.price_change_24h >= 0 ? '+' : '') + d.price_change_24h.toFixed(2) + '%';
+                changeEl.className = 'value ' + (d.price_change_24h >= 0 ? 'green' : 'red');
+                
+                // Volume
+                document.getElementById('volume-24h').textContent = Number(d.volume_24h).toLocaleString(undefined, {maximumFractionDigits: 0});
+                
+                // Momentum
+                const momEl = document.getElementById('momentum');
+                momEl.textContent = (d.momentum >= 0 ? '+' : '') + d.momentum.toFixed(2) + '%';
+                momEl.className = 'value ' + (d.momentum >= 0 ? 'green' : 'red');
+                
+                // 5D Signal
+                if (d.signal_5d) {
+                    document.getElementById('apples').textContent = d.signal_5d.apples;
+                    document.getElementById('signal-score').textContent = d.signal_5d.green;
+                    
+                    const labelEl = document.getElementById('signal-label');
+                    labelEl.textContent = d.signal_5d.signal;
+                    labelEl.className = 'signal-label ' + 
+                        (d.signal_5d.green >= 3 ? 'buy' : d.signal_5d.green <= 1 ? 'sell' : 'neutral');
+                }
+                
+                // Whale alert
+                const whaleEl = document.getElementById('whale-alert');
+                if (d.whale_alert) {
+                    whaleEl.classList.add('active');
+                    document.getElementById('whale-amount').textContent = Number(d.whale_alert.kas_amount).toLocaleString() + ' KAS';
+                    document.getElementById('whale-tier').textContent = d.whale_alert.tier;
+                    document.getElementById('whale-count').textContent = d.whale_alert.count;
+                    document.getElementById('whale-time').textContent = d.whale_alert.timestamp;
+                } else {
+                    whaleEl.classList.remove('active');
+                }
+                
+                // Prediction
+                if (d.prediction) {
+                    const p = d.prediction;
+                    const dirEl = document.getElementById('pred-direction');
+                    const arrow = p.direction === 'UP' ? '⬆️' : p.direction === 'DOWN' ? '⬇️' : '➡️';
+                    dirEl.textContent = arrow + ' ' + p.direction;
+                    dirEl.className = 'prediction-direction ' + p.direction.toLowerCase();
+                    
+                    document.getElementById('pred-change').textContent = (p.change_pct >= 0 ? '+' : '') + p.change_pct.toFixed(2) + '%';
+                    document.getElementById('pred-target').textContent = '$' + p.target.toFixed(5);
+                    document.getElementById('pred-conf').textContent = p.confidence + '%';
+                    document.getElementById('pred-reasoning').textContent = p.reasoning;
+                }
+                
+                // Chart
+                if (d.candles && d.candles.length > 0) {
+                    drawChart(d.candles);
+                }
+                
+                // Last update
+                document.getElementById('last-update').textContent = 'Last update: ' + d.last_update;
+                
+            } catch (e) {
+                console.error('Update error:', e);
+            }
+        }
+        
+        // Initial load and interval
+        updateData();
+        setInterval(updateData, 5000);
+        
+        // Resize chart on window resize
+        window.addEventListener('resize', () => {
+            fetch('/api/data').then(r => r.json()).then(d => {
+                if (d.candles) drawChart(d.candles);
+            });
+        });
+    </script>
+</body>
+</html>'''
 
-    record_price_snapshot(
-        kas_price,
-        wa.kas_amount if wa else 0,
-        wa.whale_count if wa else 0,
-    )
 
-    verify_all_pending(kas_price)
+@app.route("/")
+def index():
+    return Response(DASHBOARD_HTML, mimetype="text/html")
 
-    metrics    = [kas, sol, tao, fet]
-    score      = sum(1 for m in metrics if m.signal == "BULLISH")
-    bearish    = sum(1 for m in metrics if m.signal == "BEARISH")
-    if wa and wa.whale_count > 0:
-        score  = min(score + 1, 4)
-    confidence = sum(m.confidence for m in metrics) // 4
-    sentiment  = (
-        "🟢 BULLISH" if score >= 3
-        else "🔴 BEARISH" if bearish >= 3
-        else "🟡 NEUTRAL"
-    )
 
-    report = IntelligenceReport(
-        sentiment=sentiment,
-        sentiment_score=score,
-        confidence=confidence,
-        kas=kas,
-        sol=sol,
-        tao=tao,
-        fet=fet,
-        whale_alert=wa,
-        prediction=prediction,
-        timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        node="Kaspa Whale Oracle v3.1",
-        scan_id=str(uuid4()),
-    )
-    return report, kas_price
+@app.route("/api/data")
+def api_data():
+    """API endpoint for dashboard data"""
+    return jsonify(current_state)
 
-# ═══════════════════════════════════════════════════════════════
-# 🤖 AGENT
-# ═══════════════════════════════════════════════════════════════
 
-agent = Agent(
-    name="Kaspa Whale Oracle",
-    seed="kaspa-whale-oracle-v31-2026",
-    port=8002,
-    endpoint=["http://127.0.0.1:8002/submit"],
-)
-fund_agent_if_low(agent.wallet.address())
+@app.route("/api/whales")
+def api_whales():
+    """API endpoint for whale history"""
+    return jsonify(list(whale_history))
+
+
+@app.route("/api/health")
+def api_health():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "ok",
+        "last_update": current_state.get("last_update"),
+        "price": current_state.get("price", 0)
+    })
+
 
 # ═══════════════════════════════════════════════════════════════
 # 🚀 STARTUP
 # ═══════════════════════════════════════════════════════════════
 
-@agent.on_event("startup")
-async def startup(ctx: Context):
-    ctx.storage.set("stats", {
-        "total_queries":    0,
-        "paid_reports":     0,
-        "whale_alerts":     0,
-        "revenue_fet":      0.0,
-        "predictions_sent": 0,
-    })
-    ctx.logger.info("🐋 Kaspa Whale Oracle v3.1 — Prediction Engine")
-    ctx.logger.info(f"📍 Agent : {agent.address}")
-    ctx.logger.info(f"💰 Wallet: {WALLET_ADDRESS}")
-    ctx.logger.info(f"🤖 ASI-1 : {'✅' if ASI_API_KEY else '⚠️ Set OPEN_API_KEY secret'}")
-    try:
-        report, kas_price = await run_all_scans()
-        ctx.storage.set("latest_report", report.dict())
-        ctx.storage.set("kas_price", kas_price)
-        ctx.logger.info(f"✅ First scan: KAS=${kas_price:.5f} | {report.sentiment}")
-    except Exception as e:
-        ctx.logger.error(f"❌ Startup error: {e}")
-
-# ═══════════════════════════════════════════════════════════════
-# ⏰ MAIN LOOP
-# ═══════════════════════════════════════════════════════════════
-
-@agent.on_interval(period=SCAN_INTERVAL_SEC)
-async def main_loop(ctx: Context):
-    try:
-        report, kas_price = await run_all_scans()
-        old_raw = ctx.storage.get("latest_report")
-        ctx.storage.set("latest_report", report.dict())
-        ctx.storage.set("kas_price", kas_price)
-
-        wc = report.whale_alert.whale_count if report.whale_alert else 0
-        ctx.logger.info(
-            f"📊 {report.sentiment} | KAS=${kas_price:.5f} | "
-            f"Whale: {wc} | Acc: {accuracy_stats['pct']:.0f}%"
-        )
-
-        if report.whale_alert and report.whale_alert.whale_count > 0:
-            wa     = report.whale_alert
-            is_new = True
-            if old_raw:
-                old = IntelligenceReport(**old_raw)
-                if (
-                    old.whale_alert
-                    and old.whale_alert.kas_amount == wa.kas_amount
-                    and old.whale_alert.timestamp  == wa.timestamp
-                ):
-                    is_new = False
-            if is_new:
-                stats = ctx.storage.get("stats") or {}
-                stats["whale_alerts"]     = stats.get("whale_alerts", 0) + 1
-                stats["predictions_sent"] = stats.get("predictions_sent", 0) + (
-                    1 if report.prediction else 0
-                )
-                ctx.storage.set("stats", stats)
-                ctx.logger.info(f"🐋 {wa.tier} | {wa.kas_amount:,.0f} KAS")
-                if report.prediction:
-                    p = report.prediction
-                    ctx.logger.info(
-                        f"🔮 {p.direction} {p.change_pct:+.2f}% | "
-                        f"Target: ${p.price_target:.5f} | Conf: {p.confidence}%"
-                    )
-    except Exception as e:
-        ctx.logger.error(f"❌ Main loop error: {e}")
-
-# ═══════════════════════════════════════════════════════════════
-# 💬 CHAT PROTOCOL
-# ═══════════════════════════════════════════════════════════════
-
-chat_protocol = Protocol(spec=chat_protocol_spec)
-
-
-def _make_chat(text: str, end_session: bool = False) -> ChatMessage:
-    content = [TextContent(type="text", text=text)]
-    if end_session:
-        content.append(EndSessionContent(type="end-session"))
-    return ChatMessage(
-        timestamp=datetime.now(timezone.utc),
-        msg_id=str(uuid4()),
-        content=content,
-    )
-
-
-def _build_ai_context(report, kas_price) -> str:
-    ctx_str = f"KAS=${kas_price:.5f}. "
-    if report:
-        ctx_str += f"Market: {report.sentiment}. KAS: {report.kas.note}. "
-    if report and report.prediction:
-        p = report.prediction
-        ctx_str += (
-            f"Prediction: {p.direction} {p.change_pct:+.2f}% "
-            f"conf:{p.confidence}%. "
-        )
-    return ctx_str
-
-
-@chat_protocol.on_message(ChatMessage)
-async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
-    await ctx.send(
-        sender,
-        ChatAcknowledgement(
-            timestamp=datetime.now(timezone.utc),
-            acknowledged_msg_id=msg.msg_id,
-        ),
-    )
-
-    user_input = " ".join(
-        b.text for b in msg.content if hasattr(b, "text") and b.text
-    ).strip()
-    text_l = user_input.lower().strip()
-
-    stats = ctx.storage.get("stats") or {}
-    stats["total_queries"] = stats.get("total_queries", 0) + 1
-    ctx.storage.set("stats", stats)
-
-    raw       = ctx.storage.get("latest_report")
-    report    = IntelligenceReport(**raw) if raw else None
-    kas_price = ctx.storage.get("kas_price") or KAS_USD_ESTIMATE
-
-    if not text_l or text_l in ("hi", "hello", "hey", "start", "help"):
-        await ctx.send(sender, _make_chat(
-            "🐋 **Kaspa Whale Oracle v3.1**\n\n"
-            "Commands:\n"
-            "• `report`    — full market scan\n"
-            "• `whales`    — latest whale activity\n"
-            "• `predict`   — 5-min price prediction 🔮\n"
-            "• `accuracy`  — model performance stats\n"
-            "• `price`     — current KAS price\n\n"
-            "Or ask any question about KAS!\n"
-            "⚠️ _Not financial advice. DYOR._"
-        ))
-        return
-
-    if text_l in ("predict", "prediction", "5min", "forecast"):
-        if report and report.prediction:
-            await ctx.send(sender, _make_chat(fmt_prediction_text(report.prediction)))
-        else:
-            await ctx.send(sender, _make_chat(
-                "⏳ No prediction yet. Waiting for data…\n"
-                "Try `report` for the current market scan."
-            ))
-        return
-
-    if text_l in ("accuracy", "stats", "performance"):
-        if accuracy_stats["total"] == 0:
-            resp = "📊 Not enough data yet. Need whale events to start tracking."
-        else:
-            acc  = accuracy_stats["pct"]
-            icon = "🟢" if acc >= 65 else "🟡" if acc >= 50 else "🔴"
-            resp = (
-                f"🎯 **Prediction Performance**\n{'─' * 28}\n"
-                f"{icon} Accuracy: **{acc:.1f}%**\n"
-                f"✅ Correct: **{accuracy_stats['correct']}** | "
-                f"Total: **{accuracy_stats['total']}**\n\n"
-                f"_Verified over 5-min windows after each whale event._"
-            )
-        await ctx.send(sender, _make_chat(resp))
-        return
-
-    if text_l in ("whales", "whale"):
-        if report and report.whale_alert and report.whale_alert.whale_count > 0:
-            wa  = report.whale_alert
-            usd = wa.kas_amount * kas_price
-            await ctx.send(sender, _make_chat(
-                f"🐋 **WHALE DETECTED!**\n{'─' * 28}\n"
-                f"Size: **{wa.kas_amount:,.0f} KAS** (~${usd:,.0f})\n"
-                f"TXs: **{wa.whale_count}** | Tier: **{wa.tier}**\n"
-                f"Volume: **{wa.total_volume:,.0f} KAS**\n\n"
-                f"🔒 Pay {PRICE_FULL} FET → full TX details"
-            ))
-            await ctx.send(sender, RequestPayment(
-                accepted_funds=[
-                    Funds(amount=PRICE_FULL, currency="FET", payment_method="wallet"),
-                ],
-                recipient=agent.address,
-                deadline_seconds=PAYMENT_DEADLINE,
-                reference=str(uuid4()),
-                description="Unlock Whale TX Details",
-                metadata={"service": "whale_detail"},
-            ))
-        else:
-            await ctx.send(sender, _make_chat(
-                "🌊 No whale activity right now.\n"
-                "Threshold: 500,000 KAS. Scanning every 60 sec…"
-            ))
-        return
-
-    if text_l in ("price", "kas", "kas price"):
-        await ctx.send(sender, _make_chat(
-            f"💰 **KAS Price**: ${kas_price:.5f}\n"
-            f"🕐 Updated: {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
-        ))
-        return
-
-    if text_l in ("report", "scan", "market"):
-        if not report:
-            await ctx.send(sender, _make_chat("⏳ First scan in progress. Try in 30 seconds!"))
-            return
-        await ctx.send(sender, _make_chat(fmt_market_text(report)))
-        await ctx.send(sender, RequestPayment(
-            accepted_funds=[
-                Funds(amount=PRICE_FULL, currency="FET", payment_method="wallet"),
-            ],
-            recipient=agent.address,
-            deadline_seconds=PAYMENT_DEADLINE,
-            reference=str(uuid4()),
-            description="Kaspa Whale Oracle — Full Report",
-            metadata={"service": "full_report"},
-        ))
-        return
-
-    ai_ctx = _build_ai_context(report, kas_price)
-
-    if HAS_OPENAI and ASI_API_KEY and len(user_input) > 3:
-        try:
-            client = OpenAI(base_url="https://api.asi1.ai/v1", api_key=ASI_API_KEY)
-            resp_ai = client.chat.completions.create(
-                model="asi1-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            f"You are Kaspa Whale Oracle v3.1. Expert on KAS blockchain. "
-                            f"Current data: {ai_ctx} Be concise (max 150 words). Always add DYOR."
-                        ),
-                    },
-                    {"role": "user", "content": user_input},
-                ],
-                max_tokens=300,
-            )
-            await ctx.send(sender, _make_chat(
-                f"🤖 **AI Analysis**\n{'─' * 28}\n"
-                f"{resp_ai.choices[0].message.content}\n\n⚠️ _DYOR_"
-            ))
-        except Exception:
-            await ctx.send(sender, _make_chat(f"📊 {ai_ctx}\n\n⚠️ _DYOR_"))
-    else:
-        await ctx.send(sender, _make_chat(
-            f"📊 {ai_ctx}\n\n"
-            f"Try: `report` · `whales` · `predict` · `accuracy`"
-        ))
-
-
-@chat_protocol.on_message(ChatAcknowledgement)
-async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
-    pass
-
-
-agent.include(chat_protocol, publish_manifest=True)
-
-# ═══════════════════════════════════════════════════════════════
-# 💳 PAYMENT PROTOCOL
-# ═══════════════════════════════════════════════════════════════
-
-payment_protocol = Protocol(spec=payment_protocol_spec, role="seller")
-
-
-@payment_protocol.on_message(CommitPayment)
-async def on_payment_commit(ctx: Context, sender: str, msg: CommitPayment):
-    amount = float(msg.funds.amount)
-    if msg.funds.currency != "FET" or amount < float(PRICE_FULL):
-        await ctx.send(sender, CancelPayment(
-            transaction_id=msg.transaction_id,
-            reason=f"Need minimum {PRICE_FULL} FET.",
-        ))
-        return
-
-    await ctx.send(sender, CompletePayment(transaction_id=msg.transaction_id))
-
-    stats = ctx.storage.get("stats") or {}
-    stats["paid_reports"] = stats.get("paid_reports", 0) + 1
-    stats["revenue_fet"]  = stats.get("revenue_fet", 0.0) + amount
-    ctx.storage.set("stats", stats)
-    ctx.logger.info(f"✅ Revenue: +{amount} FET | Total: {stats['revenue_fet']:.2f}")
-
-    raw    = ctx.storage.get("latest_report")
-    report = IntelligenceReport(**raw) if raw else None
-
-    lines = ["💎 **PAID FULL REPORT**\n"]
-
-    if report:
-        lines.append(fmt_market_text(report))
-
-        if report.whale_alert and report.whale_alert.whale_count > 0:
-            wa = report.whale_alert
-            lines.append(
-                f"\n🐋 **WHALE TX DETAILS**\n"
-                f"Amount: {wa.kas_amount:,.0f} KAS\n"
-                f"Volume: {wa.total_volume:,.0f} KAS\n"
-                f"TXs: {wa.whale_count}\n"
-            )
-            if wa.transactions:
-                for i, tx in enumerate(wa.transactions[:5], 1):
-                    lines.append(
-                        f"  {i}. `{tx.get('tx_id', '?')}…` — "
-                        f"{tx.get('amount', 0):,.0f} KAS"
-                    )
-
-        if report.prediction:
-            p = report.prediction
-            lines.append(
-                f"\n🔮 **PREDICTION**\n"
-                f"Direction: {p.direction} {p.change_pct:+.2f}%\n"
-                f"Target: ${p.price_target:.6f} | Conf: {p.confidence}%\n"
-                f"Reason: _{p.reasoning}_\n"
-                f"Model accuracy: {accuracy_stats['pct']:.1f}% "
-                f"({accuracy_stats['correct']}/{accuracy_stats['total']})\n"
-            )
-    else:
-        lines.append("⏳ First scan in progress.")
-
-    await ctx.send(sender, _make_chat("\n".join(lines)))
-
-
-@payment_protocol.on_message(RejectPayment)
-async def on_payment_reject(ctx: Context, sender: str, msg: RejectPayment):
-    await ctx.send(sender, _make_chat(
-        "❌ Payment cancelled.\nFree features still available — try `report` or `predict`!"
-    ))
-
-
-agent.include(payment_protocol, publish_manifest=True)
-
-# ═══════════════════════════════════════════════════════════════
-# 📨 DIRECT INTEL REQUEST
-# ═══════════════════════════════════════════════════════════════
-
-@agent.on_message(model=IntelRequest, replies={IntelligenceReport, ErrorResponse})
-async def handle_intel_request(ctx: Context, sender: str, msg: IntelRequest):
-    raw = ctx.storage.get("latest_report")
-    if not raw:
-        await ctx.send(sender, ErrorResponse(error="No report yet."))
-        return
-    report = IntelligenceReport(**raw)
-    if report.sentiment_score < msg.min_score:
-        await ctx.send(sender, ErrorResponse(
-            error=f"Score {report.sentiment_score} < min {msg.min_score}"
-        ))
-        return
-    await ctx.send(sender, report)
-
-# ═══════════════════════════════════════════════════════════════
-# 🍏 FLASK DASHBOARD
-# ═══════════════════════════════════════════════════════════════
-
-flask_app = Flask(__name__)
-
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>🍏 Kaspa Whale Oracle</title>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap');
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-
-        body {
-            background: #05070a;
-            color: white;
-            font-family: 'Orbitron', Arial, sans-serif;
-            overflow: hidden;
-        }
-
-        #header {
-            position: fixed;
-            top: 0; left: 0; right: 0;
-            height: 70px;
-            background: rgba(5,7,10,0.97);
-            display: flex;
-            align-items: center;
-            padding: 0 20px;
-            z-index: 20;
-            border-bottom: 1px solid rgba(59,130,246,0.2);
-            gap: 15px;
-        }
-
-        .logo {
-            font-size: 30px;
-            filter: drop-shadow(0 0 12px rgba(34,197,94,0.9));
-            animation: pulse 2s ease-in-out infinite;
-        }
-
-        @keyframes pulse {
-            0%,100% { transform: scale(1); }
-            50%      { transform: scale(1.12); }
-        }
-
-        .title {
-            font-size: 14px;
-            font-weight: 900;
-            letter-spacing: 2px;
-            background: linear-gradient(135deg, #22c55e, #3b82f6);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-
-        #pred-box {
-            background: rgba(17,24,39,0.9);
-            border: 1px solid rgba(59,130,246,0.3);
-            border-radius: 10px;
-            padding: 8px 15px;
-            font-size: 11px;
-            letter-spacing: 1px;
-            min-width: 220px;
-        }
-
-        #pred-direction {
-            font-size: 15px;
-            font-weight: 900;
-        }
-
-        #price-box {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-left: auto;
-        }
-
-        #price-apple { font-size: 26px; transition: all 0.3s; }
-
-        #price {
-            font-size: 20px;
-            font-weight: 900;
-            letter-spacing: 1px;
-            transition: color 0.3s;
-        }
-
-        #whale-alert {
-            position: fixed;
-            top: 85px; right: 25px;
-            z-index: 30;
-            font-size: 0px;
-            font-weight: 900;
-            opacity: 0;
-            transition: all 0.4s cubic-bezier(0.34,1.56,0.64,1);
-            pointer-events: none;
-            letter-spacing: 1px;
-        }
-
-        #whale-alert.show {
-            font-size: 18px;
-            opacity: 1;
-        }
-
-        #apple-meter {
-            position: fixed;
-            left: 12px;
-            top: 50%;
-            transform: translateY(-50%);
-            z-index: 15;
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-            align-items: center;
-        }
-
-        .am {
-            font-size: 20px;
-            opacity: 0.15;
-            transition: all 0.4s;
-        }
-
-        .am.on {
-            opacity: 1;
-            transform: scale(1.5);
-            filter: drop-shadow(0 0 8px rgba(34,197,94,0.9));
-        }
-
-        #dolphin-box {
-            position: fixed;
-            right: 12px; bottom: 45px;
-            z-index: 15;
-            text-align: center;
-            font-size: 10px;
-            letter-spacing: 1px;
-        }
-
-        #dolphin-emoji {
-            font-size: 36px;
-            display: block;
-            animation: swim 3s ease-in-out infinite;
-        }
-
-        @keyframes swim {
-            0%,100% { transform: translateX(-8px) rotate(-5deg); }
-            50%      { transform: translateX(8px)  rotate(5deg);  }
-        }
-
-        #dolphin-txt { margin-top: 4px; transition: all 0.4s; }
-
-        #accuracy-box {
-            position: fixed;
-            top: 85px; left: 50px;
-            z-index: 15;
-            background: rgba(17,24,39,0.85);
-            border: 1px solid rgba(59,130,246,0.2);
-            border-radius: 8px;
-            padding: 8px 12px;
-            font-size: 10px;
-            letter-spacing: 1px;
-        }
-
-        #stats-bar {
-            position: fixed;
-            bottom: 0; left: 0; right: 0;
-            height: 35px;
-            background: rgba(5,7,10,0.95);
-            border-top: 1px solid rgba(59,130,246,0.1);
-            display: flex;
-            align-items: center;
-            padding: 0 60px 0 50px;
-            gap: 25px;
-            z-index: 15;
-            font-size: 10px;
-            letter-spacing: 1px;
-            color: #374151;
-        }
-
-        .sv { color: #6b7280; font-weight: 700; }
-        .sg { color: #22c55e; }
-        .sr { color: #ef4444; }
-
-        canvas {
-            display: block;
-            margin-top: 70px;
-            background: #05070a;
-        }
-    </style>
-</head>
-<body>
-
-<div id="header">
-    <span class="logo">🍏</span>
-    <div>
-        <div class="title">KASPA WHALE ORACLE</div>
-        <div style="font-size:9px;color:#374151;letter-spacing:2px;">
-            5D PREDICTION ENGINE
-        </div>
-    </div>
-
-    <div id="pred-box">
-        <div style="color:#4b5563;margin-bottom:3px;">🔮 5-MIN PREDICTION</div>
-        <span id="pred-direction">--</span>
-        <span id="pred-pct" style="margin-left:8px;">--</span>
-        <span id="pred-conf" style="margin-left:8px;color:#4b5563;">conf: --%</span>
-    </div>
-
-    <div id="price-box">
-        <span id="price-apple">🍏</span>
-        <div id="price">KAS $--</div>
-    </div>
-</div>
-
-<div id="whale-alert"></div>
-
-<div id="apple-meter">
-    <div style="font-size:8px;color:#1f2937;writing-mode:vertical-rl;margin-bottom:4px;">SIGNAL</div>
-    <div class="am" id="am5">🍏</div>
-    <div class="am" id="am4">🍏</div>
-    <div class="am" id="am3">🍋</div>
-    <div class="am" id="am2">🍎</div>
-    <div class="am" id="am1">🍎</div>
-    <div style="font-size:8px;color:#1f2937;writing-mode:vertical-rl;margin-top:4px;">POWER</div>
-</div>
-
-<div id="accuracy-box">
-    🎯 ACCURACY: <span id="acc-pct" style="color:#22c55e;">--%</span>
-    <span id="acc-stats" style="color:#374151;">(0/0)</span>
-</div>
-
-<div id="dolphin-box">
-    <span id="dolphin-emoji">🐬</span>
-    <div id="dolphin-txt" style="color:#374151;">SCANNING...</div>
-</div>
-
-<div id="stats-bar">
-    <span>🍏 BUYS: <span class="sv sg" id="s-buys">0</span></span>
-    <span>🍎 SELLS: <span class="sv sr" id="s-sells">0</span></span>
-    <span>🐳 WHALES: <span class="sv" id="s-whales">0</span></span>
-    <span>📈 MOMENTUM: <span class="sv" id="s-mom">0%</span></span>
-    <span>🕐 UPDATED: <span class="sv" id="s-time">--</span></span>
-    <span style="margin-left:auto;color:#22c55e;">● LIVE</span>
-</div>
-
-<canvas id="chart"></canvas>
-
-<script>
-const canvas = document.getElementById('chart');
-const ctx    = canvas.getContext('2d');
-
-let lastPrice  = 0;
-let prevPrice  = 0;
-let lastWhalTs = null;
-
-function resize() {
-    canvas.width  = window.innerWidth;
-    canvas.height = window.innerHeight - 70 - 35;
-}
-window.addEventListener('resize', resize);
-resize();
-
-function updateMeter(pct) {
-    ['am1','am2','am3','am4','am5'].forEach(id =>
-        document.getElementById(id).classList.remove('on')
-    );
-    let id = 'am3';
-    if      (pct >=  1.5) id = 'am5';
-    else if (pct >=  0.5) id = 'am4';
-    else if (pct >= -0.5) id = 'am3';
-    else if (pct >= -1.5) id = 'am2';
-    else                  id = 'am1';
-    document.getElementById(id).classList.add('on');
-}
-
-function updateDolphin(direction, whale) {
-    const txt = document.getElementById('dolphin-txt');
-    const em  = document.getElementById('dolphin-emoji');
-    if (whale) {
-        txt.innerText   = '🐳 WHALE!';
-        txt.style.color = '#f59e0b';
-        em.style.filter = 'drop-shadow(0 0 15px rgba(251,191,36,0.9))';
-        return;
-    }
-    if (direction === 'UP') {
-        txt.innerText   = '🍏 BUY';
-        txt.style.color = '#22c55e';
-        em.style.filter = 'drop-shadow(0 0 12px rgba(34,197,94,0.8))';
-    } else if (direction === 'DOWN') {
-        txt.innerText   = '🍎 SELL';
-        txt.style.color = '#ef4444';
-        em.style.filter = 'drop-shadow(0 0 12px rgba(239,68,68,0.8))';
-    } else {
-        txt.innerText   = '🌊 WAIT';
-        txt.style.color = '#374151';
-        em.style.filter = 'none';
-    }
-}
-
-function showWhale(amount) {
-    const el = document.getElementById('whale-alert');
-    el.innerText        = `🐳 WHALE! ${Number(amount).toLocaleString()} KAS`;
-    el.style.color      = '#f59e0b';
-    el.style.textShadow = '0 0 20px rgba(251,191,36,0.9)';
-    el.classList.add('show');
-    setTimeout(() => el.classList.remove('show'), 4000);
-}
-
-function drawGrid() {
-    ctx.strokeStyle = 'rgba(255,255,255,0.025)';
-    ctx.lineWidth   = 1;
-    for (let x = 0; x < canvas.width;  x += 60) {
-        ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke();
-    }
-    for (let y = 0; y < canvas.height; y += 60) {
-        ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke();
-    }
-}
-
-function drawCandles(trades) {
-    if (trades.length < 2) return;
-    const prices    = trades.map(t => t.price);
-    const minP      = Math.min(...prices) * 0.9995;
-    const maxP      = Math.max(...prices) * 1.0005;
-    const range     = maxP - minP || 1;
-    const pad       = canvas.height * 0.1;
-    const groupSize = Math.max(1, Math.floor(trades.length / 60));
-    const candles   = [];
-
-    function toY(p) {
-        return pad + (1 - (p - minP) / range) * (canvas.height - pad * 2);
-    }
-
-    for (let i = 0; i < trades.length; i += groupSize) {
-        const group = trades.slice(i, i + groupSize);
-        candles.push({
-            open:  group[0].price,
-            close: group[group.length-1].price,
-            high:  Math.max(...group.map(t => t.price)),
-            low:   Math.min(...group.map(t => t.price)),
-            isUp:  group[group.length-1].price >= group[0].price
-        });
-    }
-
-    candles.forEach((c, i) => {
-        const x  = (i / Math.max(candles.length-1,1)) * canvas.width;
-        const cW = Math.max(4, canvas.width / candles.length * 0.7);
-
-        ctx.strokeStyle = c.isUp ? 'rgba(34,197,94,0.6)' : 'rgba(239,68,68,0.6)';
-        ctx.lineWidth   = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(x, toY(c.high));
-        ctx.lineTo(x, toY(c.low));
-        ctx.stroke();
-
-        const bodyTop = Math.min(toY(c.open), toY(c.close));
-        const bodyH   = Math.max(Math.abs(toY(c.close) - toY(c.open)), 2);
-        const g = ctx.createLinearGradient(x-cW/2, bodyTop, x+cW/2, bodyTop+bodyH);
-
-        if (c.isUp) {
-            g.addColorStop(0,   '#86efac');
-            g.addColorStop(0.5, '#22c55e');
-            g.addColorStop(1,   '#052e16');
-            ctx.shadowColor = 'rgba(34,197,94,0.4)';
-        } else {
-            g.addColorStop(0,   '#fca5a5');
-            g.addColorStop(0.5, '#ef4444');
-            g.addColorStop(1,   '#450a0a');
-            ctx.shadowColor = 'rgba(239,68,68,0.4)';
-        }
-        ctx.shadowBlur = 8;
-        ctx.fillStyle  = g;
-        ctx.fillRect(x-cW/2, bodyTop, cW, bodyH);
-        ctx.shadowBlur = 0;
-    });
-}
-
-function drawBubbles(trades) {
-    const prices = trades.map(t => t.price);
-    const minP   = Math.min(...prices) * 0.9995;
-    const maxP   = Math.max(...prices) * 1.0005;
-    const range  = maxP - minP || 1;
-    const pad    = canvas.height * 0.1;
-
-    trades.forEach((t, i) => {
-        if (!t.whale && t.value < 1000) return;
-        const x = (i / Math.max(trades.length-1,1)) * canvas.width;
-        const y = pad + (1-(t.price-minP)/range)*(canvas.height-pad*2);
-
-        let r = Math.sqrt(t.value) / 20;
-        r = Math.max(4, Math.min(r, 32));
-        if (t.whale) r *= 2;
-
-        const g = ctx.createRadialGradient(x-r*0.3, y-r*0.3, r*0.05, x, y, r);
-        if (t.side === 'BUY') {
-            g.addColorStop(0,   '#ffffff');
-            g.addColorStop(0.2, '#86efac');
-            g.addColorStop(0.6, '#22c55e');
-            g.addColorStop(1,   '#052e16');
-            ctx.shadowColor = t.whale ? 'rgba(34,197,94,1)' : 'rgba(34,197,94,0.4)';
-        } else {
-            g.addColorStop(0,   '#ffffff');
-            g.addColorStop(0.2, '#fca5a5');
-            g.addColorStop(0.6, '#ef4444');
-            g.addColorStop(1,   '#450a0a');
-            ctx.shadowColor = t.whale ? 'rgba(239,68,68,1)' : 'rgba(239,68,68,0.4)';
-        }
-        
+def start_scanner():
+    """Start the background scanner in a separate thread"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(scanner_loop())
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("🍏 KASPA WHALE ORACLE v4.0")
+    print("=" * 60)
+    print("📊 Dashboard: http://localhost:5000")
+    print("📡 API: http://localhost:5000/api/data")
+    print("🐋 Whales: http://localhost:5000/api/whales")
+    print("=" * 60)
+    
+    # Start scanner in background thread
+    scanner_thread = threading.Thread(target=start_scanner, daemon=True)
+    scanner_thread.start()
+    
+    # Run Flask
+    app.run(host="0.0.0.0", port=5000, debug=False)
